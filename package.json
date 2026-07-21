@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test \"test/**/*.test.js\""
   },
   "dependencies": {
     "onnxruntime-node": "^1.21.0"
