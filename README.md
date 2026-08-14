@@ -46,3 +46,18 @@ curl -X POST https://<host>/reload \
 | `R2_ACCESS_KEY_ID`            | R2 access key                                             |
 | `R2_SECRET_ACCESS_KEY`        | R2 secret                                                 |
 | `R2_BUCKET_NAME`              | R2 bucket (e.g. `propplus-ml-models`)                     |
+
+## Rank-encoder artifacts
+
+`district_rank.json`, `project_rank.json` and `developer_rank.json` are **not**
+configured by env var — they are fetched from the same R2 folder as
+`FEATURE_SCHEMA_R2_KEY`, and only the ones the schema actually references.
+A referenced file that is missing or malformed fails the load: serving every
+listing as an unseen district would quietly delete a trained feature.
+
+## Missing values
+
+Anything unknown is sent to the model as `NaN`, never as `0` or a sentinel —
+`0` means "at 0°N 0°E" or "a 0-bedroom home", which the model believes.
+The cross-repo rules (and the two deliberate exceptions) are documented at the
+top of `src/features.js`.

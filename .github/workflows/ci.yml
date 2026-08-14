@@ -24,5 +24,14 @@ jobs:
         # the unit tests import src/features.js only and never load the runtime.
         run: npm ci --ignore-scripts
 
+      # ADR-030: grep the case count so a test file that disappears or
+      # self-skips turns the run red instead of looking like "everything
+      # passed". Update the number here in the same commit that changes the
+      # suite — that is the intended human checkpoint, not an annoyance.
       - name: Run tests
-        run: npm test
+        shell: bash # gives -o pipefail, so `| tee` cannot swallow the exit code
+        run: |
+          npm test | tee "$RUNNER_TEMP/unit.log"
+          grep -qE '^# pass 20$'   "$RUNNER_TEMP/unit.log"
+          grep -qE '^# fail 0$'    "$RUNNER_TEMP/unit.log"
+          grep -qE '^# skipped 0$' "$RUNNER_TEMP/unit.log"
