@@ -1,7 +1,7 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import onnxruntime from 'onnxruntime-node';
-import { buildFeatureTensor } from './features.js';
+import { assertSchemaSupported, buildFeatureTensor, rankArtifactsFor } from './features.js';
 
 const PORT = Number(process.env.PORT) || 3002;
 const SERVICE_TOKEN = process.env.PRICE_MODEL_SERVICE_TOKEN;
@@ -18,7 +18,7 @@ const R2_REGION = 'auto';
 let session = null;
 let inputName = null;
 let featureSchema = null;
-let districtRankMap = null;
+let rankMaps = {};
 let shapGlobal = null;
 let modelVersion = null;
 let modelReady = false;
@@ -102,25 +102,41 @@ async function initializeModel() {
   session = await onnxruntime.InferenceSession.create(modelBuf);
   inputName = session.inputNames[0];
   featureSchema = JSON.parse(schemaBuf.toString('utf-8'));
-  districtRankMap = await loadDistrictRankMapIfNeeded(featureSchema);
+  // Fail at load, not per-request: if the trainer added a column this service
+  // cannot encode, every prediction from now on would be silently wrong.
+  assertSchemaSupported(featureSchema);
+  rankMaps = await loadRankMaps(featureSchema);
   shapGlobal = JSON.parse(shapBuf.toString('utf-8'));
   modelVersion = deriveVersion(MODEL_R2_KEY);
   modelReady = true;
-  console.log(`Model loaded: version=${modelVersion}, features=${featureSchema.length}`);
+  console.log(
+    `Model loaded: version=${modelVersion}, features=${featureSchema.length}, ` +
+      `rank encoders=[${Object.keys(rankMaps).join(', ')}]`
+  );
 }
 
-async function loadDistrictRankMapIfNeeded(schema) {
-  if (!schema.includes('district_rank')) return {};
-  const key = deriveSiblingArtifactKey(FEATURE_SCHEMA_R2_KEY, 'district_rank.json');
-  if (!key) {
-    throw new Error('Cannot derive district_rank.json key from FEATURE_SCHEMA_R2_KEY');
+/**
+ * Download the rank-encoder artifacts the schema actually uses
+ * (district_rank.json / project_rank.json / developer_rank.json).
+ * Missing artifact = hard failure: serving every listing as "unseen" would
+ * quietly delete a feature the model was trained on.
+ */
+async function loadRankMaps(schema) {
+  const wanted = rankArtifactsFor(schema);
+  const maps = {};
+  for (const [col, filename] of Object.entries(wanted)) {
+    const key = deriveSiblingArtifactKey(FEATURE_SCHEMA_R2_KEY, filename);
+    if (!key) {
+      throw new Error(`Cannot derive ${filename} key from FEATURE_SCHEMA_R2_KEY`);
+    }
+    const buf = await downloadFromR2(key);
+    const parsed = JSON.parse(buf.toString('utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`Invalid rank artifact for ${col}: ${key}`);
+    }
+    maps[col] = parsed;
   }
-  const buf = await downloadFromR2(key);
-  const parsed = JSON.parse(buf.toString('utf-8'));
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`Invalid district rank artifact: ${key}`);
-  }
-  return parsed;
+  return maps;
 }
 
 function deriveSiblingArtifactKey(key, filename) {
@@ -130,16 +146,12 @@ function deriveSiblingArtifactKey(key, filename) {
 }
 
 // ---------- Feature encoding ----------
-// featureSchema is an ordered array of column names produced by the Python trainer.
-// Names follow these prefixes:
-//   ptype_<id> / ptype_nan          → one-hot property_type_id
-//   tenure_<value> / tenure_nan     → one-hot tenure
-//   fquota_<value> / fquota_nan     → one-hot foreign_quota_status
-//   district_rank                   → ordinal int
-//   dist_<kind>_m                   → landmark distance in meters
-//   view_<value>                    → multi-hot view_type
-//   area_sqm, bedrooms_count, bathrooms_count, completion_year,
-//   is_off_plan, is_price_negotiable → numeric / binary
+// The column vocabulary and the missing-value rules live in src/features.js —
+// that file is the cross-repo contract with the trainer and is unit-tested.
+// Anything the schema contains and features.js does not recognise makes
+// initializeModel() throw, so the service never serves a half-understood model.
+
+/** Local helper for output arithmetic only — NOT for building the tensor. */
 function num(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
@@ -154,7 +166,7 @@ function topShapFeatures(limit = 5) {
 }
 
 async function predictPrice(features) {
-  const tensor = buildFeatureTensor(features, featureSchema, districtRankMap);
+  const tensor = buildFeatureTensor(features, featureSchema, rankMaps);
   const ortTensor = new onnxruntime.Tensor('float32', tensor, [1, featureSchema.length]);
   const result = await session.run({ [inputName]: ortTensor });
   const outName = session.outputNames[0];
